@@ -1,0 +1,22 @@
+{
+  "_comment": "USD per 1M tokens. First matching key in _order wins (substring on model name, lowercased). Editable.",
+  "_order": ["opus", "sonnet", "haiku", "claude", "minimax", "abab", "qwen", "deepseek", "gemma", "llama", "default"],
+  "prices": {
+    "opus":    {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
+    "sonnet":  {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
+    "haiku":   {"input": 1.0,  "output": 5.0,  "cache_read": 0.1,  "cache_write": 1.25},
+    "claude":  {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
+    "minimax": {"input": 0.3,  "output": 1.1,  "cache_read": 0.0,  "cache_write": 0.0},
+    "abab":    {"input": 0.3,  "output": 1.1,  "cache_read": 0.0,  "cache_write": 0.0},
+    "qwen":    {"input": 0.0,  "output": 0.0,  "cache_read": 0.0,  "cache_write": 0.0},
+    "deepseek":{"input": 0.0,  "output": 0.0,  "cache_read": 0.0,  "cache_write": 0.0},
+    "gemma":   {"input": 0.0,  "output": 0.0,  "cache_read": 0.0,  "cache_write": 0.0},
+    "llama":   {"input": 0.0,  "output": 0.0,  "cache_read": 0.0,  "cache_write": 0.0},
+    "default": {"input": 0.0,  "output": 0.0,  "cache_read": 0.0,  "cache_write": 0.0}
+  },
+  "subscriptions": [
+    {"name": "Claude Subscription", "monthly_usd": 200.0, "keys": ["opus", "sonnet", "haiku", "claude"]},
+    {"name": "MiniMax Subscription", "monthly_usd": 50.0,  "keys": ["minimax", "abab"]}
+  ],
+  "_subscriptions_comment": "Amortized daily (monthly/30.44). Models whose name matches a 'keys' substring are flagged as 'sub' (flat rate, marginal token cost). Local models (qwen/gemma/llama) are 0. Anything else with price>0 is pay-per-use."
+}

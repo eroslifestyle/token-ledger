@@ -1,0 +1,18 @@
+# Local database and runtime artifacts — NEVER commit these
+ledger.db
+ledger.db-journal
+*.db
+*.db-journal
+__pycache__/
+*.pyc
+*.pyo
+widget_state.json
+router-model-map.jsonl
+
+# Personal / session data
+.claude/
+projects/
+
+# OS
+.DS_Store
+Thumbs.db
