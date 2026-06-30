@@ -27,6 +27,8 @@ DB_PATH = BASE / "ledger.db"
 PRICES_PATH = BASE / "prices.json"
 WIDGET_STATE = BASE / "widget_state.json"
 ROUTER_SIDECAR = Path.home() / ".claude" / "logs" / "router-model-map.jsonl"
+_MINIMAX_PLAN_CACHE_FILE = BASE / ".minimax_plan_cache.json"
+_MINIMAX_PLAN_TTL = 300  # 5 minuti — l'API cambia raramente più spesso
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 
@@ -264,7 +266,9 @@ def collect_claude(con, order, prices) -> int:
     n = 0
     if not CLAUDE_PROJECTS.exists():
         return 0
-    for jf in CLAUDE_PROJECTS.glob("*/*.jsonl"):
+    # Ricorsivo: cattura anche subagenti (subagents/) e workflow (wf_*/).
+    # Vedi ~/.claude/projects/<proj>/<uuid>/subagents/agent-<id>.jsonl
+    for jf in CLAUDE_PROJECTS.rglob("*.jsonl"):
         key = f"claude:{jf}"
         try:
             size = jf.stat().st_size
@@ -275,6 +279,8 @@ def collect_claude(con, order, prices) -> int:
             last_off = 0
         if last_off == size:
             continue
+        # Ricava progetto dalla path (per subagenti senza cwd nel JSONL)
+        path_project = project_from_cwd(str(jf.parts[7])) if len(jf.parts) > 7 else ""
         try:
             with jf.open("r", encoding="utf-8", errors="replace") as fh:
                 fh.seek(last_off)
@@ -282,6 +288,9 @@ def collect_claude(con, order, prices) -> int:
                     ev = parse_claude_line(line)
                     if ev is None:
                         continue
+                    # Fallback progetto: usa path se il JSONL non ha cwd
+                    if not ev.get("project") and path_project:
+                        ev["project"] = path_project
                     ev["cost_usd"] = cost_anthropic(
                         ev["model"], ev["input_tokens"], ev["output_tokens"],
                         ev["cache_read_tokens"], ev["cache_creation_tokens"], order, prices,
@@ -417,7 +426,150 @@ def write_widget_state(con):
         "savings_usd": round(float(sav[0]), 2) if sav else 0.0,
         "tokens_saved": int(sav[1]) if sav else 0,
     }
+    # MiniMax piano ufficiale — lettura con cache TTL 5 min
+    mm_plan = None
+    try:
+        cache = json.loads(_MINIMAX_PLAN_CACHE_FILE.read_text()) if _MINIMAX_PLAN_CACHE_FILE.exists() else {}
+        if time.time() - cache.get("ts", 0) < _MINIMAX_PLAN_TTL:
+            mm_plan = cache
+        else:
+            from collect_minimax_api import fetch_plan
+            mm_plan = fetch_plan()
+            if mm_plan:
+                _MINIMAX_PLAN_CACHE_FILE.write_text(json.dumps(mm_plan))
+    except Exception as exc:
+        mm_plan = {"error": str(exc)}
+    if mm_plan:
+        state["minimax_plan"] = mm_plan
     WIDGET_STATE.write_text(json.dumps(state, indent=2))
+
+
+# ---------------------------------------------------------------- m3 tools
+# Aggrega log di m3-web/m3-wiki/m3-code/m3x/m3-fanout (path ~/.claude/m3/usage.jsonl).
+# Fonte separata da claude_code perché i tool MiniMax girano FUORI da Claude Code:
+# non scrivono JSONL in projects/, solo qui. Senza questo collettore il 70%+ del
+# consumo MiniMax (m3-code per il coding, m3-wiki per i wiki) è invisibile.
+
+M3_USAGE_LOG = Path.home() / ".claude" / "m3" / "usage.jsonl"
+ROUTER_USAGE_LOG = Path.home() / ".claude" / "logs" / "router-usage.jsonl"
+
+
+def collect_m3_tools(con, order, prices) -> int:
+    """Legge ~/.claude/m3/usage.jsonl e inserisce ogni record come usage_events."""
+    if not M3_USAGE_LOG.exists():
+        return 0
+    key = f"m3tools:{M3_USAGE_LOG}"
+    last_off = int(get_state(con, key, "0"))
+    try:
+        size = M3_USAGE_LOG.stat().st_size
+    except OSError:
+        return 0
+    if last_off > size:  # log ruotato
+        last_off = 0
+    if last_off == size:
+        return 0
+    n = 0
+    with M3_USAGE_LOG.open("r", encoding="utf-8", errors="replace") as fh:
+        fh.seek(last_off)
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            ts = _parse_iso(r.get("ts"))
+            if not ts:
+                continue
+            model = normalize_model(r.get("model") or "MiniMax-unknown")
+            inp = int(r.get("prompt_tokens", 0) or 0)
+            out = int(r.get("completion_tokens", 0) or 0)
+            reasoning = int(r.get("reasoning_tokens", 0) or 0)
+            # Tool identifica la subapp (m3-web, m3-wiki, m3-code, ecc.)
+            tool = r.get("tool") or r.get("subcommand") or "m3"
+            # UUID deterministico per evitare duplicati su re-run
+            uuid = f"m3-{ts}-{hashlib.md5((str(ts)+model+tool+str(inp)+str(out)).encode()).hexdigest()[:12]}"
+            ev = {
+                "event_uuid": uuid,
+                "ts": ts,
+                "source": f"m3_{tool}",
+                "session_id": None,
+                "project": "m3-tools",
+                "model": model,
+                "input_tokens": inp,
+                "output_tokens": out + reasoning,  # reasoning è output "extra"
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+            }
+            ev["cost_usd"] = cost_anthropic(
+                model, inp, out + reasoning, 0, 0, order, prices,
+            )
+            if _insert(con, ev):
+                n += 1
+        new_off = fh.tell()
+    set_state(con, key, new_off)
+    return n
+
+
+# ---------------------------------------------------------------- router usage
+# Cattura TUTTE le richieste che passano dal router proxy (qualunque client:
+# Claude Code, m3-code, m3-web, m3x, subagenti, tool locali). Il router
+# logga ts + orig/final model + input/output tokens in router-usage.jsonl.
+# È il single source of truth per i tool che non scrivono JSONL Claude Code.
+
+def collect_router_usage(con, order, prices) -> int:
+    if not ROUTER_USAGE_LOG.exists():
+        return 0
+    key = f"router:{ROUTER_USAGE_LOG}"
+    last_off = int(get_state(con, key, "0"))
+    try:
+        size = ROUTER_USAGE_LOG.stat().st_size
+    except OSError:
+        return 0
+    if last_off > size:
+        last_off = 0
+    if last_off == size:
+        return 0
+    n = 0
+    with ROUTER_USAGE_LOG.open("r", encoding="utf-8", errors="replace") as fh:
+        fh.seek(last_off)
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            ts = int(r.get("ts") or time.time())
+            model = normalize_model(r.get("orig") or r.get("final") or "router-unknown")
+            inp = int(r.get("input_tokens", 0) or 0)
+            out = int(r.get("output_tokens", 0) or 0)
+            cread = int(r.get("cache_read", 0) or 0)
+            cwrite = int(r.get("cache_creation", 0) or 0)
+            client = r.get("client", "router")[:32]
+            mode = r.get("mode", "?")
+            # UUID deterministico per evitare duplicati su re-run
+            uuid = f"rt-{ts}-{hashlib.md5((str(ts)+model+client+str(inp)+str(out)).encode()).hexdigest()[:12]}"
+            ev = {
+                "event_uuid": uuid,
+                "ts": ts,
+                "source": f"router_{mode}",
+                "session_id": None,
+                "project": f"router/{client}",
+                "model": model,
+                "input_tokens": inp,
+                "output_tokens": out,
+                "cache_read_tokens": cread,
+                "cache_creation_tokens": cwrite,
+            }
+            ev["cost_usd"] = cost_anthropic(model, inp, out, cread, cwrite, order, prices)
+            if _insert(con, ev):
+                n += 1
+        new_off = fh.tell()
+    set_state(con, key, new_off)
+    return n
 
 
 # ---------------------------------------------------------------- main
@@ -425,6 +577,8 @@ def run(quick=False):
     order, prices = load_prices()
     con = db_connect()
     n_claude = collect_claude(con, order, prices)
+    n_m3 = collect_m3_tools(con, order, prices)
+    n_router = collect_router_usage(con, order, prices)
     n_lite = 0
     if not quick:
         n_lite = collect_litellm(con)
@@ -433,7 +587,7 @@ def run(quick=False):
     con.commit()
     total = con.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0]
     con.close()
-    print(f"collected: claude_code +{n_claude}, litellm +{n_lite} | total events: {total}")
+    print(f"collected: claude_code +{n_claude}, m3_tools +{n_m3}, router +{n_router}, litellm +{n_lite} | total events: {total}")
 
 
 def selftest():
@@ -443,7 +597,7 @@ def selftest():
     # 1. parsing riga claude valida
     sample = json.dumps({
         "type": "assistant", "uuid": "u-1", "timestamp": "2026-06-26T10:00:00.000Z",
-        "sessionId": "s-1", "cwd": "/home/user/.claude",
+        "sessionId": "s-1", "cwd": "/home/mrxxx/.claude",
         "message": {"model": "claude-opus-4-8", "usage": {
             "input_tokens": 100, "output_tokens": 50,
             "cache_read_input_tokens": 200, "cache_creation_input_tokens": 10}},
